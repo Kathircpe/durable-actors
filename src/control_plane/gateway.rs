@@ -59,21 +59,8 @@ impl Gateway {
         epoch: u64,
         authorization: &str,
     ) -> Result<String> {
-<<<<<<< HEAD
-        let principal = self.invocations.authenticate_authorization(authorization)?;
-        let capability = principal
-            .invocation
-            .context("invocation capability missing")?;
-        ensure!(
-            principal.actor == *actor
-                && capability.actor == *actor
-                && capability.owner_epoch == epoch,
-            "invocation target mismatch"
-        );
-=======
         let capability = self.capability(actor, authorization)?;
         ensure!(capability.owner_epoch == epoch, "invalid owner epoch");
->>>>>>> main
         Ok(backend_origin(&capability.route)?.to_string())
     }
 
@@ -112,7 +99,10 @@ impl Gateway {
         let capability = principal
             .invocation
             .context("invocation capability missing")?;
-        ensure!(capability.actor == *actor, "invocation target mismatch");
+        ensure!(
+            principal.actor == *actor && capability.actor == *actor,
+            "invocation target mismatch"
+        );
         Ok(capability)
     }
 }

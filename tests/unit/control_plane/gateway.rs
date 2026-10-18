@@ -116,6 +116,10 @@ async fn signed_route_rejects_divergent_principal_actor() -> Result<()> {
         )?,
         "http://10.1.2.3:7101/"
     );
+
+    assert!(gateway.authorize_publish(&capability_actor, &authorization).is_err());
+
+
     Ok(())
 }
 
