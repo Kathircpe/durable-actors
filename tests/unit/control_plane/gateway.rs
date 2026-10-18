@@ -96,8 +96,16 @@ async fn signed_route_rejects_divergent_principal_actor() -> Result<()> {
         "http://10.1.2.3:7101",
     )?;
     let authorization = format!("Bearer {}", token.token);
-    assert!(gateway.invocation_route(&capability_actor, 7, &authorization).is_err());
-    assert!(gateway.invocation_route(&principal_actor, 7, &authorization).is_err());
+    assert!(
+        gateway
+            .invocation_route(&capability_actor, 7, &authorization)
+            .is_err()
+    );
+    assert!(
+        gateway
+            .invocation_route(&principal_actor, 7, &authorization)
+            .is_err()
+    );
     let control = issuer.issue_invocation_target(
         &capability_actor,
         &crate::host::HostId::new("host.v3.test.one"),
@@ -109,16 +117,15 @@ async fn signed_route_rejects_divergent_principal_actor() -> Result<()> {
         "http://10.1.2.3:7101",
     )?;
     assert_eq!(
-        gateway.invocation_route(
-            &capability_actor,
-            7,
-            &format!("Bearer {}", control.token)
-        )?,
+        gateway.invocation_route(&capability_actor, 7, &format!("Bearer {}", control.token))?,
         "http://10.1.2.3:7101/"
     );
 
-    assert!(gateway.authorize_publish(&capability_actor, &authorization).is_err());
-
+    assert!(
+        gateway
+            .authorize_publish(&capability_actor, &authorization)
+            .is_err()
+    );
 
     Ok(())
 }
