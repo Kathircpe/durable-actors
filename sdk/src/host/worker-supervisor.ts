@@ -1,31 +1,29 @@
 import { Worker } from "node:worker_threads"
 
 import type { ActorIdentity } from "../actor/identity.js"
-import { actorKey } from "../actor/identity.js"
-import type { SocketQuery } from "../actor/socketProtocol.js"
-import type { SocketEffect } from "../actor/socketProtocol.js"
+import type { SocketEffect, SocketQuery } from "../actor/socketProtocol.js"
 import { errorMessage } from "../errors.js"
 
-import { failedReply } from "./protocol.js"
+import type { DatabaseRequest } from "./database-bridge.js"
+import { completeDatabaseCall } from "./database-bridge.js"
+import type { DatabaseCall } from "./database.js"
 import type {
+    ActorExecutionCommand,
     ActorExecutorCommand,
     ActorExecutorReply,
+    ActorWorkerCommand,
     ActorWorkerData,
     ActorWorkerMessage,
     ActorWorkerRequest,
-    EvictCommand,
-    HydrateCommand,
-    InvokeCommand,
-    WebSocketEventCommand
+    EvictCommand
 } from "./protocol.js"
-import { completePersistence } from "./sqlite-persistence.js"
-import type { SqlitePersister } from "./sqlite-persistence.js"
-import type { SqliteCommitter } from "./sqlite.js"
+import { failedReply } from "./protocol.js"
 import type {
     ActorWorkerFactory,
     ActorWorkerHandle,
     ActorWorkerState,
     ActorWorkerSupervisorOptions,
+    DatabaseRequester,
     ResidentActorWorkerOptions,
     SocketPublisher,
     SocketSource
@@ -42,13 +40,12 @@ class ActorWorker implements ActorWorkerHandle {
             resolve: (reply: ActorExecutorReply) => void
             reject: (error: Error) => void
             allowNextInvocation: (() => void) | undefined
-            commit: SqliteCommitter
-            persist: SqlitePersister
+            database: DatabaseRequester
             publish: SocketPublisher | undefined
             connections: SocketSource | undefined
         }
     >()
-    private readonly persisting = new Set<SharedArrayBuffer>()
+    private readonly databaseCalls = new Set<DatabaseRequest>()
     private nextMessageId = 0
     private lifecycleState: ActorWorkerState = "starting"
     private terminalError: Error | undefined
@@ -105,11 +102,8 @@ class ActorWorker implements ActorWorkerHandle {
                 allowNextInvocation()
                 return
             }
-            case "persist_sqlite":
-                void this.persistSqlite(message.messageId, message.commitId, message.buffer, message.txid)
-                return
-            case "commit_sqlite":
-                void this.commitSqlite(message.messageId)
+            case "database_call":
+                void this.callDatabase(message.messageId, message.call, message.request)
                 return
             case "get_connections":
                 void this.loadConnections(message.messageId, message.query)
@@ -156,10 +150,9 @@ class ActorWorker implements ActorWorkerHandle {
     }
 
     async execute(
-        command: InvokeCommand | WebSocketEventCommand | HydrateCommand,
+        command: ActorWorkerCommand,
         allowNextInvocation: () => void,
-        commit: SqliteCommitter,
-        persist: SqlitePersister,
+        database: DatabaseRequester,
         publish?: SocketPublisher,
         connections?: SocketSource
     ): Promise<ActorExecutorReply> {
@@ -174,8 +167,7 @@ class ActorWorker implements ActorWorkerHandle {
                     resolve,
                     reject,
                     allowNextInvocation,
-                    commit,
-                    persist,
+                    database,
                     publish,
                     connections
                 })
@@ -190,33 +182,16 @@ class ActorWorker implements ActorWorkerHandle {
         this.stop(new ActorWorkerTerminatedError(reason))
     }
 
-    private async persistSqlite(
-        messageId: number,
-        commitId: number,
-        buffer: SharedArrayBuffer,
-        txid?: number
-    ): Promise<void> {
-        this.persisting.add(buffer)
+    private async callDatabase(messageId: number, call: DatabaseCall, request: DatabaseRequest): Promise<void> {
+        this.databaseCalls.add(request)
         try {
-            const pending = this.pending.get(messageId)
-            if (pending === undefined) throw new Error("SQLite persistence has no active invocation")
-            const result = txid === undefined ? { txid: await pending.commit() } : await pending.persist(commitId, txid)
-            completePersistence(buffer, { result })
+            const database = this.pending.get(messageId)?.database
+            if (database === undefined) throw new Error("actor database call has no active invocation")
+            completeDatabaseCall(request, { result: await database(call) })
         } catch (error) {
-            completePersistence(buffer, { error: errorMessage(error) })
+            completeDatabaseCall(request, { error: errorMessage(error) })
         } finally {
-            this.persisting.delete(buffer)
-        }
-    }
-
-    private async commitSqlite(messageId: number): Promise<void> {
-        try {
-            const pending = this.pending.get(messageId)
-            if (pending === undefined) throw new Error("SQLite commit has no active invocation")
-            const txid = await pending.commit()
-            this.post({ type: "sqlite_committed", messageId, txid })
-        } catch (error) {
-            this.post({ type: "sqlite_committed", messageId, error: errorMessage(error) })
+            this.databaseCalls.delete(request)
         }
     }
 
@@ -274,8 +249,8 @@ class ActorWorker implements ActorWorkerHandle {
         this.readyReject?.(this.terminalError)
         this.readyResolve = undefined
         this.readyReject = undefined
-        for (const buffer of this.persisting) completePersistence(buffer, { error: this.terminalError.message })
-        this.persisting.clear()
+        for (const request of this.databaseCalls) completeDatabaseCall(request, { error: this.terminalError.message })
+        this.databaseCalls.clear()
         for (const pending of this.pending.values()) pending.reject(this.terminalError)
         this.pending.clear()
         this.worker.unref()
@@ -286,10 +261,10 @@ class ActorWorkerSupervisor {
     private readonly actorEntrypointUrl: string
     private readonly createWorker: ActorWorkerFactory
     private resident: ResidentActorWorker | undefined
-    private lastActiveActors = "[]"
-    private readonly activeActorListeners = new Set<() => void>()
+    private lastResident = false
+    private readonly residencyListeners = new Set<() => void>()
     private speculativeWorker: ActorWorkerHandle | undefined
-    private identity: string | undefined
+    private identity: ActorIdentity | undefined
     private closed = false
     private actorNames: readonly string[] | undefined
     private lastSequence = 0
@@ -308,52 +283,52 @@ class ActorWorkerSupervisor {
         return this.actorNames
     }
 
+    assign(actor: ActorIdentity): void {
+        if (!this.actorNames?.includes(actor.actor_name))
+            throw new Error(`actor name ${actor.actor_name} is not loaded in this customer process`)
+        this.identity = { ...actor }
+    }
+
     async handle(
         command: ActorExecutorCommand,
         allowNextInvocation: () => void,
-        commit: SqliteCommitter,
-        persist: SqlitePersister,
+        database: DatabaseRequester,
         publish?: SocketPublisher,
         connections?: SocketSource
     ): Promise<ActorExecutorReply> {
         if (this.closed) return failedReply("actor_worker_terminated", "actor supervisor is closed")
-        const identity = actorKey(command.actor)
-        if (this.identity !== undefined && this.identity !== identity)
-            return failedReply("actor_identity_mismatch", "sandbox is permanently assigned to another actor")
-        if (command.type !== "evict") this.identity ??= identity
         switch (command.type) {
             case "hydrate":
             case "invoke":
             case "websocket_event":
                 try {
-                    if (this.actorNames === undefined) await this.ready()
-                    return await this.execute(command, allowNextInvocation, commit, persist, publish, connections)
+                    return await this.execute(command, allowNextInvocation, database, publish, connections)
                 } catch (error) {
                     return failedReply("actor_worker_failed", errorMessage(error))
                 }
             case "evict":
-                return this.evict(command)
+                return this.evict(command, allowNextInvocation, database)
             default:
                 throw command satisfies never
         }
     }
 
-    onActiveActorsChange(listener: () => void): () => void {
-        this.activeActorListeners.add(listener)
+    onResidencyChange(listener: () => void): () => void {
+        this.residencyListeners.add(listener)
         return () => {
-            this.activeActorListeners.delete(listener)
+            this.residencyListeners.delete(listener)
         }
     }
 
-    private notifyActiveActorsChange(): void {
-        const current = JSON.stringify(this.activeActors())
-        if (current === this.lastActiveActors) return
-        this.lastActiveActors = current
-        for (const listener of this.activeActorListeners) listener()
+    private notifyResidencyChange(): void {
+        const current = this.isResident()
+        if (current === this.lastResident) return
+        this.lastResident = current
+        for (const listener of this.residencyListeners) listener()
     }
 
-    activeActors(): readonly ActorIdentity[] {
-        return this.resident?.isActive() ? [this.resident.identity] : []
+    isResident(): boolean {
+        return this.resident?.isActive() ?? false
     }
 
     close(): void {
@@ -364,7 +339,7 @@ class ActorWorkerSupervisor {
     }
 
     private preload(): ActorWorkerHandle {
-        const worker = this.createWorker({ moduleUrl: this.actorEntrypointUrl }, () => this.notifyActiveActorsChange())
+        const worker = this.createWorker({ moduleUrl: this.actorEntrypointUrl }, () => this.notifyResidencyChange())
         this.speculativeWorker = worker
         void worker.ready().catch(() => this.discardPreload(worker))
         return worker
@@ -376,36 +351,26 @@ class ActorWorkerSupervisor {
     }
 
     private execute(
-        command: InvokeCommand | WebSocketEventCommand | HydrateCommand,
+        command: ActorExecutionCommand,
         allowNextInvocation: () => void,
-        commit: SqliteCommitter,
-        persist: SqlitePersister,
+        database: DatabaseRequester,
         publish?: SocketPublisher,
         connections?: SocketSource
     ): Promise<ActorExecutorReply> {
-        if (!this.actorNames?.includes(command.actor.actor_name)) {
-            return Promise.resolve(
-                failedReply(
-                    "actor_name_not_found",
-                    `actor name ${command.actor.actor_name} is not loaded in this customer process`
-                )
-            )
-        }
+        const workerCommand = this.workerCommand(command)
         let actor = this.resident
         if (actor === undefined) {
-            if (command.resident_only) return Promise.resolve({ type: "state_required" })
             actor = new ResidentActorWorker({
-                identity: command.actor,
                 sequenceBase: this.lastSequence,
                 moduleUrl: this.actorEntrypointUrl,
                 worker: this.takeSpeculativeWorker(),
                 createWorker: this.createWorker,
-                onActiveActorsChange: () => this.notifyActiveActorsChange()
+                onResidencyChange: () => this.notifyResidencyChange()
             })
             this.resident = actor
         }
         const base = actor.sequenceBase
-        return actor.execute(command, allowNextInvocation, commit, persist, publish, connections).then(reply => {
+        return actor.execute(workerCommand, allowNextInvocation, database, publish, connections).then(reply => {
             if ((reply.type === "invoked" || reply.type === "websocket_handled") && reply.sequence !== undefined) {
                 const sequence = base + reply.sequence
                 this.lastSequence = Math.max(this.lastSequence, sequence)
@@ -415,10 +380,26 @@ class ActorWorkerSupervisor {
         })
     }
 
-    private evict(_command: EvictCommand): ActorExecutorReply {
-        this.resident?.terminate("resident actor was evicted by the Rust host")
+    private async evict(
+        command: EvictCommand,
+        allowNextInvocation: () => void,
+        database: DatabaseRequester
+    ): Promise<ActorExecutorReply> {
+        const actor = this.resident
+        if (actor === undefined) return { type: "evicted" }
+        try {
+            await actor.execute(this.workerCommand(command), allowNextInvocation, database)
+        } catch {
+            // The thread is still stopped when onSleep fails.
+        }
         this.resident = undefined
+        actor.terminate("resident actor was evicted by the Rust host")
         return { type: "evicted" }
+    }
+
+    private workerCommand(command: ActorExecutorCommand): ActorWorkerCommand {
+        if (this.identity === undefined) throw new Error("actor supervisor has no assigned actor")
+        return { ...command, actor: this.identity }
     }
 
     private takeSpeculativeWorker(): ActorWorkerHandle | undefined {
@@ -429,37 +410,33 @@ class ActorWorkerSupervisor {
 }
 
 class ResidentActorWorker {
-    readonly identity: ActorIdentity
     readonly sequenceBase: number
     readonly moduleUrl: string
     readonly createWorker: ActorWorkerFactory
-    private readonly onActiveActorsChange: () => void
+    private readonly onResidencyChange: () => void
     private worker: ActorWorkerHandle | undefined
 
     constructor(options: ResidentActorWorkerOptions) {
-        this.identity = { ...options.identity }
         this.sequenceBase = options.sequenceBase
         this.moduleUrl = options.moduleUrl
         this.createWorker = options.createWorker
-        this.onActiveActorsChange = options.onActiveActorsChange
+        this.onResidencyChange = options.onResidencyChange
         this.worker = options.worker
     }
 
     async execute(
-        command: InvokeCommand | WebSocketEventCommand | HydrateCommand,
+        command: ActorWorkerCommand,
         allowNextInvocation: () => void,
-        commit: SqliteCommitter,
-        persist: SqlitePersister,
+        database: DatabaseRequester,
         publish?: SocketPublisher,
         connections?: SocketSource
     ): Promise<ActorExecutorReply> {
-        if (this.worker === undefined && command.resident_only) return { type: "state_required" }
-        this.worker ??= this.createWorker({ moduleUrl: this.moduleUrl }, this.onActiveActorsChange)
+        this.worker ??= this.createWorker({ moduleUrl: this.moduleUrl }, this.onResidencyChange)
         const worker = this.worker
-        this.onActiveActorsChange()
+        this.onResidencyChange()
         let reply: ActorExecutorReply
         try {
-            reply = await worker.execute(command, allowNextInvocation, commit, persist, publish, connections)
+            reply = await worker.execute(command, allowNextInvocation, database, publish, connections)
         } catch (error) {
             reply = failedReply(
                 error instanceof ActorWorkerTerminatedError ? "actor_worker_terminated" : "actor_worker_failed",
@@ -476,7 +453,7 @@ class ResidentActorWorker {
         ) {
             worker.terminate("actor invocation failed")
             this.worker = undefined
-            this.onActiveActorsChange()
+            this.onResidencyChange()
         }
         return reply
     }
@@ -488,7 +465,7 @@ class ResidentActorWorker {
     terminate(reason: string): void {
         this.worker?.terminate(reason)
         this.worker = undefined
-        this.onActiveActorsChange()
+        this.onResidencyChange()
     }
 }
 

@@ -1,11 +1,11 @@
+mod actor_database;
 mod actor_host;
-mod actor_runtime;
 mod assignment;
+mod config;
 pub(crate) mod http;
 mod lease_maintenance;
 mod persistence;
 mod process;
-mod queues;
 pub(crate) mod sockets;
 mod spare;
 pub(crate) mod storage;
@@ -13,10 +13,11 @@ pub(crate) mod storage;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub(crate) use self::process::host_idle_timeout_ms;
-pub use self::process::{ActorHostConfig, serve_actor_host};
+pub(crate) use self::config::host_idle_timeout_ms;
+pub use self::process::serve_actor_host;
 pub use self::spare::serve_spare;
 pub(crate) use self::{
+    actor_database::HostDatabase,
     actor_host::ActorHost,
     lease_maintenance::{HostLeaseMaintainer, LeaseRenewalTask},
 };
